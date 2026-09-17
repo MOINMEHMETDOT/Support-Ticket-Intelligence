@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+
+# Assessment source material (not ours to redistribute)
+*.docx
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Generated artifacts
+*.db
+*.sqlite3
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
