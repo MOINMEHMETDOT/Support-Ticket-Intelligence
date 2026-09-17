@@ -46,7 +46,10 @@ class OllamaProvider(LLMProvider):
                     f"Ollama has no model named {self.model!r}. "
                     f"Run: ollama pull {self.model}"
                 ) from exc
-            raise LLMError(f"Ollama returned {exc.response.status_code}: {detail}") from exc
+            raise LLMError(
+                f"Ollama returned {exc.response.status_code}: {detail}",
+                retryable=exc.response.status_code >= 500,
+            ) from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"Ollama request failed: {exc}") from exc
 

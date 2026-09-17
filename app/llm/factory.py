@@ -4,11 +4,23 @@ from __future__ import annotations
 
 from app.config import Settings
 from app.llm.base import LLMError, LLMProvider
+from app.llm.retry import RetryingProvider
 
 SUPPORTED = ("gemini", "groq", "ollama")
 
 
-def build_provider(settings: Settings) -> LLMProvider:
+def build_provider(settings: Settings, *, retries: bool = True) -> LLMProvider:
+    """Construct the configured provider, wrapped with backoff by default.
+
+    Retries are applied here rather than inside each provider so all three get
+    identical behaviour. Pass retries=False in tests that assert on raw
+    provider errors.
+    """
+    provider = _build_bare(settings)
+    return RetryingProvider(provider) if retries else provider
+
+
+def _build_bare(settings: Settings) -> LLMProvider:
     provider = settings.provider
 
     if provider == "gemini":

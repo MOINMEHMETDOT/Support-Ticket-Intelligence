@@ -21,3 +21,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Eval reports are run artifacts; the README carries the headline numbers.
+evals/reports/

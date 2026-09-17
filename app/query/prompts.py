@@ -64,6 +64,12 @@ REFERENCE DATE
   wherever you need the current time. The age_hrs column is already computed
   against it.
 
+  Relative day windows use CALENDAR-DAY boundaries, not rolling hours:
+    "the last 7 days"  ->  date(created_at) >= date('{reference}', '-7 days')
+  Not datetime(...,'-7 days'), which measures a rolling 168 hours from the
+  current time of day and answers the same question with a different number.
+  Pick the calendar reading every time so the answer is reproducible.
+
 CRITICAL SEMANTICS
   - resolution_time_hrs and customer_rating are NULL for every Open and
     Escalated ticket. NULL means "not resolved yet", not "unknown".

@@ -33,7 +33,11 @@ class GroqProvider(LLMProvider):
                 temperature=temperature,
             )
         except Exception as exc:  # noqa: BLE001 — SDK raises a wide error family
-            raise LLMError(f"Groq call failed: {exc}") from exc
+            message = str(exc)
+            transient = "429" in message or "rate limit" in message.lower() or any(
+                code in message for code in ("500", "502", "503", "504")
+            )
+            raise LLMError(f"Groq call failed: {message}", retryable=transient) from exc
 
         text = (response.choices[0].message.content or "").strip()
         if not text:

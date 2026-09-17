@@ -12,7 +12,16 @@ from abc import ABC, abstractmethod
 
 
 class LLMError(RuntimeError):
-    """Raised when a provider is misconfigured or the upstream call fails."""
+    """Raised when a provider is misconfigured or the upstream call fails.
+
+    `retryable` separates transient conditions — rate limits, upstream 5xx —
+    from permanent ones like a bad key or a missing model. Retrying the latter
+    just turns a fast, clear failure into a slow one.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class LLMProvider(ABC):

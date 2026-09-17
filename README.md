@@ -108,8 +108,9 @@ Or run them separately: `./run.sh api` / `./run.sh ui`, or `uvicorn app.api.main
 ### Verify
 
 ```bash
-pytest                        # 63 tests, no network required
-python scripts/smoke_test.py  # runs the brief's sample questions against the live LLM
+pytest                        # 132 tests, offline, ~2s
+python -m evals.run           # 41-case answer-quality suite against the live model
+python scripts/smoke_test.py  # quick sanity run of the brief's sample questions
 ```
 
 ---
@@ -125,7 +126,8 @@ app/
 ├── llm/
 │   ├── base.py          LLMProvider ABC — the only interface the app talks to
 │   ├── gemini.py  groq.py  ollama.py
-│   └── factory.py       Provider selection
+│   ├── retry.py         Exponential backoff for transient failures
+│   └── factory.py       Provider selection + retry wrapping
 ├── query/
 │   ├── prompts.py       Schema-derived prompts + few-shot examples
 │   ├── guards.py        Validation of LLM-generated SQL
@@ -133,6 +135,13 @@ app/
 ├── anomaly/detectors.py Seven deterministic detectors
 ├── api/main.py          FastAPI
 └── ui/streamlit_app.py  Streamlit, talks to the API over HTTP
+
+evals/                   Answer-quality measurement (costs API calls)
+├── cases.py             41 golden cases, expected values computed via SQL
+├── runner.py            Scoring, flakiness, JSON reports
+└── run.py               CLI
+
+tests/                   Correctness (offline, ~2s)
 ```
 
 ### Why these pieces
@@ -310,11 +319,66 @@ Every finding carries severity, affected ticket IDs, and an `evidence` object st
 
 ---
 
+## Evaluation
+
+`pytest` proves the code does what it claims. It cannot tell you whether *the system plus the model* answers questions correctly — that needs a different instrument, so it lives in `evals/` rather than `tests/`. Conflating the two gives you a test suite that is slow, flaky, and quietly tolerant of regressions.
+
+```bash
+python -m evals.run                     # against the running API
+python -m evals.run --direct            # in-process, key from .env
+python -m evals.run --trials 3          # consistency, not just accuracy
+python -m evals.run --category ranking  # iterate on one weak spot
+```
+
+**41 cases across 7 categories.** Two rules make the numbers mean something:
+
+1. **Every expected value was computed against the dataset with SQL**, never taken from a model's output. An eval seeded from model responses only measures whether the system still agrees with itself.
+2. **Assertions target the computed result, not the SQL string.** There are many correct queries for "how many tickets are open"; there is one correct answer. Matching SQL text fails valid rewrites and passes wrong-but-familiar ones.
+
+The runner takes an `ask` callable rather than building an engine, so the same scoring logic grades the live API, an in-process engine, or a fake in unit tests. `--trials N` runs each case repeatedly and reports a **pass rate**, separating *flaky* from *broken* — an intermittent failure in a stochastic system is a different problem from a consistent one, and averaging them into one accuracy number hides it.
+
+### Baseline run — gemini-3.1-flash-lite, 40 cases
+
+| Category | Score | |
+| --- | --- | --- |
+| aggregation | 9/9 | 100% |
+| filtering | 5/5 | 100% |
+| null_semantics | 7/7 | 100% |
+| ranking | 6/6 | 100% |
+| refusal | 5/5 | 100% |
+| robustness | 4/5 | 80% |
+| temporal | 2/3 | 67% |
+
+**Accuracy 95.0%** · latency **p50 3.5s, p95 8.5s** · 321s total.
+
+### What it caught that manual testing hadn't
+
+**1. No backoff on rate limits.** The very first run died 17 cases in: 40 questions × 2 LLM calls saturates a free-tier per-minute quota in about two minutes, and every later case failed with a 429 that had nothing to do with answer quality. Rate limits are an expected operating condition on a free tier, not an error. Fixed with `app/llm/retry.py` — exponential backoff with jitter, applied at the factory so all three providers inherit it, and only for errors marked `retryable` so a bad key still fails fast instead of failing slowly.
+
+**2. "Last 7 days" was genuinely ambiguous.** The model answered 55 using a rolling 168-hour window; the calendar-day reading gives 63. Both are defensible, which is exactly the problem — the *system* should own that business convention rather than letting the model re-decide it per call. The prompt now pins the calendar reading explicitly.
+
+**3. Two of my own expectations were wrong, not the system's behaviour.** Asked "how many tickets have a priority of Urgent?", I expected `0`. The system instead explained that Urgent isn't a valid priority and listed the real ones — which is better, since a bare `0` reads as "none are urgent" rather than "that word means nothing here". I changed the expectation and added `robust-empty-valid` as its counterpart, covering a query that is valid but genuinely matches nothing.
+
+That third finding is the one worth dwelling on. An eval is only useful if you are willing to conclude the eval was wrong — and only honest if you don't reach for that conclusion every time a case fails.
+
+> The two prompt/case fixes are verified per-category (robustness now 6/6). A full clean re-run needs the server restarted so the retry wrapper is live; see [Re-running](#re-running).
+
+### Re-running
+
+The most reliable path is `--direct`, which needs no server:
+
+```bash
+echo "GEMINI_API_KEY=your_key" >> .env
+python -m evals.run --direct --delay 4
+```
+
+`--delay` paces requests under the free-tier per-minute limit. With backoff now in place it is belt-and-braces, but it keeps a full run from burning retry budget.
+
 ## Known limitations
 
 **The SLA detector is blunt on this dataset.** It flags 169 of 173 unresolved tickets, because the data spans three months and no unresolved ticket is recent — the youngest is already hundreds of hours old. The detector is *correct*; it just isn't *discriminating* here. On a live feed, where most open tickets are hours old, it would be. If this dataset were the real steady state, I'd switch the primary signal to age percentile within priority band rather than an absolute threshold. `aging_high_priority` and the IQR detectors are the ones that actually separate signal from noise here.
 
-**Two LLM calls per question** (translate, then phrase) — roughly 2–5s end to end. The second call is skippable for API consumers that only want rows; I'd add `?narrate=false` before putting this behind a UI that people use all day.
+**Two LLM calls per question** (translate, then phrase) — measured at p50 3.5s, p95 8.5s across the eval suite. The second call is skippable for API consumers that only want rows; I'd add `?narrate=false` before putting this behind a UI that people use all day.
 
 **No conversational memory.** Every question is independent, so "what about Billing?" after a Technical question won't resolve. Deliberate for a first version — carrying context needs a resolution step for pronouns and ellipsis that's a meaningful chunk of work to do correctly, and doing it badly produces answers to questions nobody asked.
 
@@ -330,10 +394,12 @@ Every finding carries severity, affected ticket IDs, and an `evidence` object st
 
 ## Testing
 
-63 tests, no network access required (a scripted fake stands in for the LLM):
+132 tests, no network access required (a scripted fake stands in for the LLM):
 
 | File | Covers |
 | --- | --- |
+| `test_retry.py` | Backoff growth, the cap, that permanent errors fail fast, and that the attempt budget is respected — with `sleep` injected, so it runs instantly |
+| `test_evals.py` | The scorer itself: value matching, row counts, refusals, flakiness, known-gap accounting. A mis-grading scorer is worse than none, because it produces a number people trust |
 | `test_guards.py` | 9 injection/unsafe-SQL strings, fence stripping, LIMIT injection, CTEs, literals containing keywords |
 | `test_data.py` | Row count, derived `age_hrs`, the NULL⇔unresolved invariant, truncation, writes blocked at the connection |
 | `test_anomalies.py` | Each detector's invariants, severity ordering, determinism, filter validation |
@@ -347,6 +413,6 @@ Every finding carries severity, affected ticket IDs, and an `evidence` object st
 ## What I'd do next
 
 1. **Query result caching** keyed on the normalized question — the same six questions get asked constantly, and each currently costs two LLM calls.
-2. **Evaluation set** — ~50 question/expected-SQL pairs, run against each provider, so "did that prompt change help?" becomes a measurement instead of an opinion. This is the piece I'd want first before touching prompts again.
+2. **Intent routing.** Ask "are there any anomalies in resolution times?" and the question goes to SQL, which returns a maximum rather than an anomaly — the seven detectors are unreachable from natural language. A routing step choosing between `sql_query` and `anomaly_report` would close that, and the eval suite already has the shape to measure whether it helped.
 3. **Trend detection over time** — the current detectors are a snapshot. "Escalation rate in Technical doubled week over week" needs a time-series comparison the dataset's three months can just about support.
 4. **Streaming responses** so the UI shows the SQL while the narration is still generating.
